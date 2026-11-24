@@ -85,10 +85,16 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
 /// What the runtime does when the host GPU fails for good: report it like a
 /// crash and end the run. The console has no such state, and carrying on
 /// draws nothing at seconds per frame.
-static ON_FAILURE: OnceLock<fn(&str) -> !> = OnceLock::new();
+static ON_FAILURE: OnceLock<fn(&str, u32) -> !> = OnceLock::new();
 
-/// Sets what a host GPU failure does (the runtime's crash report).
-pub fn on_failure(report: fn(&str) -> !) {
+/// What a failure that is not a device removal ends the process with.
+const DXGI_ERROR_DEVICE_REMOVED: u32 = 0x887A_0005;
+
+/// Sets what a host GPU failure does (the runtime's crash report): the
+/// report's text and an exit code, the device's removal reason (for
+/// example `DXGI_ERROR_DEVICE_HUNG`) or `DXGI_ERROR_DEVICE_REMOVED` when
+/// the device was not removed.
+pub fn on_failure(report: fn(&str, u32) -> !) {
     let _ = ON_FAILURE.set(report);
 }
 
@@ -97,10 +103,12 @@ pub fn on_failure(report: fn(&str) -> !) {
 /// diagnostics build names the command).
 pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     let mut text = what.to_string();
+    let mut code = DXGI_ERROR_DEVICE_REMOVED;
     if let Some(host) = host() {
         // SAFETY: a plain query.
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
+            code = e.code().0 as u32;
         }
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
@@ -112,7 +120,7 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
     tracing::error!("{text}");
     match ON_FAILURE.get() {
-        Some(report) => report(&text),
+        Some(report) => report(&text, code),
         None => std::process::abort(),
     }
 }
@@ -324,13 +332,12 @@ type States = std::collections::HashMap<
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
 
-/// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
-/// builds).
+/// Whether device-removed data is on (`VICTORY_D3D12_DRED`), in any build:
+/// it is the runtime's, and a release build reports where the GPU stopped
+/// with it (diagnostics builds add each command's note).
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
-    })
+    *ON.get_or_init(|| std::env::var_os("VICTORY_D3D12_DRED").is_some())
 }
 
 /// Whether each list of a submission runs and is timed on its own, slow
@@ -559,11 +566,22 @@ impl Host {
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
-            let pipelines: std::collections::BTreeSet<String> = runs
+            // By list, numbered as a removal report's breadcrumbs number
+            // them, so a list stopped there can be matched with its pipelines.
+            let by_list: Vec<String> = runs
                 .iter()
-                .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .enumerate()
+                .filter_map(|(i, l)| {
+                    let pipelines = l.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+                    (!pipelines.is_empty()).then(|| format!("list {i}: {pipelines:?}"))
+                })
                 .collect();
-            tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
+            tracing::warn!(
+                ms = gpu.as_millis(),
+                lists = runs.len(),
+                pipelines = by_list.join("; "),
+                "slow host submission"
+            );
         }
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
@@ -612,6 +630,11 @@ impl Host {
     /// at and what the draws and dispatches in flight there run (or, in
     /// lists that never started, the pipelines they bind).
     fn removal_data(&self, runs: &[&HostList]) -> String {
+        // Without it the queries fail as unsupported, which reads like a
+        // missing GPU feature.
+        if !dred_on() {
+            return "; VICTORY_D3D12_DRED=1 records where the GPU stopped".to_owned();
+        }
         let Ok(dred) = self.device.cast::<ID3D12DeviceRemovedExtendedData1>() else {
             return String::new();
         };

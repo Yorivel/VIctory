@@ -27,12 +27,11 @@ extern "system" fn create_device(
 /// A host GPU failure ends the run like a crash: reported to the crash log,
 /// then the process ends as the console ends a title.
 #[cfg(windows)]
-fn host_gpu_failed(what: &str) -> ! {
+fn host_gpu_failed(what: &str, code: u32) -> ! {
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
     victory_loader::log_crash(&format!("VIctory: host GPU failure: {what}"));
-    const DXGI_ERROR_DEVICE_REMOVED: u32 = 0x887A_0005;
-    // SAFETY: ends our own process.
-    unsafe { TerminateProcess(GetCurrentProcess(), DXGI_ERROR_DEVICE_REMOVED) };
+    // SAFETY: ends our own process, with the removal reason as its exit code.
+    unsafe { TerminateProcess(GetCurrentProcess(), code) };
     unreachable!("the process has ended")
 }
 
