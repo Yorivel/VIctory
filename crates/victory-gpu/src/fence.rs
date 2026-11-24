@@ -1,12 +1,13 @@
-//! Fences: a 64-bit value and the events waiting for it. Nothing runs on a
-//! GPU yet, so only signals (the title's, later our queues') move one.
+//! Fences: a 64-bit value and the events (or threads) waiting for it.
+//! Signals, the title's and our queues', move one; so do lists'
+//! bottom-of-pipe writes to its address, which set no events.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
 
-use crate::object::{self, E_NOTIMPL, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
+use crate::object::{self, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
 pub(crate) const FENCE_IIDS: [Iid; 4] = [
@@ -30,6 +31,8 @@ struct Fence {
     flags: u32,
     /// Events to set once the value reaches theirs (handles as integers).
     waiters: Mutex<Vec<(u64, usize)>>,
+    /// Woken at every signal, for threads blocked in a wait with no event.
+    reached: Condvar,
 }
 
 fn fence<'a>(this: This) -> &'a Fence {
@@ -50,6 +53,7 @@ pub(crate) extern "system" fn create(
         value: AtomicU64::new(initial),
         flags,
         waiters: Mutex::new(Vec::new()),
+        reached: Condvar::new(),
     });
     object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
 }
@@ -88,10 +92,18 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return S_OK;
     }
     if event.is_null() {
-        // shortcut: a null event means "block until reached"; nothing can
-        // reach it while no GPU work runs, so fail instead of hanging.
-        tracing::warn!(value, "blocking fence wait not implemented");
-        return E_NOTIMPL;
+        // A null event means "block until reached". A signal wakes the
+        // wait at once; a list's bottom-of-pipe write to the fence's
+        // address (`gpu_address`) moves the value without one, so the
+        // value is also checked every millisecond.
+        while fence.value.load(Ordering::Acquire) < value {
+            waiters = fence
+                .reached
+                .wait_timeout(waiters, std::time::Duration::from_millis(1))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        return S_OK;
     }
     waiters.push((value, event as usize));
     S_OK
@@ -107,6 +119,7 @@ pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
         }
         !reached
     });
+    fence.reached.notify_all();
     S_OK
 }
 
@@ -161,13 +174,45 @@ mod tests {
         assert_eq!(wait(f, 5, event), S_OK, "already reached");
         // SAFETY: as above.
         assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
-        assert_eq!(wait(f, 9, std::ptr::null_mut()), E_NOTIMPL);
+        // A wait with no event blocks until another thread signals.
+        let (at, signal_at) = (f as usize, signal as usize);
+        let signaller = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            // SAFETY: the fence's signal slot, read above.
+            let signal: extern "system" fn(This, u64) -> HRESULT =
+                unsafe { std::mem::transmute(signal_at) };
+            signal(at as This, 9)
+        });
+        assert_eq!(wait(f, 9, std::ptr::null_mut()), S_OK);
+        assert_eq!(slot::<extern "system" fn(This) -> u64>(f, 0x40)(f), 9);
+        assert_eq!(signaller.join().unwrap(), S_OK);
         // Grand Theft Auto VI reads the value at the fence's address.
         let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
         // SAFETY: the fence's value.
-        assert_eq!(unsafe { *(at as *const u64) }, 5);
+        assert_eq!(unsafe { *(at as *const u64) }, 9);
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+
+    /// A list's bottom-of-pipe write to the fence's address (`gpu_address`)
+    /// moves the value without a signal; a wait with no event still ends.
+    #[test]
+    fn a_wait_with_no_event_sees_a_value_written_to_the_fence_address() {
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 1, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f) as usize;
+        let fence = f as usize;
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let wait =
+                slot::<extern "system" fn(This, u64, *mut c_void) -> HRESULT>(fence as This, 0x48);
+            let _ = done.send(wait(fence as This, 9, std::ptr::null_mut()));
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        crate::queue::Written::Value(9).write(at as *mut u8, 8);
+        let result = finished.recv_timeout(std::time::Duration::from_secs(2));
+        assert_eq!(result, Ok(S_OK), "the wait did not end");
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
     }
 }
